@@ -1,0 +1,480 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+
+local LP = Players.LocalPlayer
+local Char = LP.Character or LP.CharacterAdded:Wait()
+local Root = Char:WaitForChild("HumanoidRootPart", 10)
+local Humanoid = Char:WaitForChild("Humanoid", 10)
+
+local RADIUS = 50
+local PUSH_FORCE = 75
+local SLOW_POWER = 3
+local MAX_BODIES = 300
+local SLEEP_INTERVAL = 0.05
+
+local ENABLED = true
+local ANTI_TOUCH = true
+local VISUAL_RING = true
+local SHOW_NOTIFICATIONS = true
+
+local function isNPC(model)
+    if not model or model == Char then return false end
+    if model.Parent == Char then return false end
+
+    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+    if not humanoid then return false end
+    if humanoid == Humanoid then return false end
+    if humanoid.Health <= 0 then return false end
+
+    local playerFromChar = Players:GetPlayerFromCharacter(model)
+    if playerFromChar then return false end
+
+    return true
+end
+
+local function isEnemyNPC(model)
+    if not isNPC(model) then return false end
+    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+    if not humanoid then return false end
+
+    local name = model.Name:lower()
+    local enemyKeywords = {"enemy", "npc", "monster", "boss", "zombie", "mob",
+                           "bandit", "guard", "soldier", "slime", "ghost", "skeleton",
+                           "goblin", "orc", "troll", "dragon", "spider", "bat",
+                           "wolf", "cultist", "pirate", "ninja", "samurai",
+                           "demon", "devil", "angel", "robot", "drone", "turret",
+                           "noob", "dummy", "target", "raid", "bounty"}
+
+    for _, kw in ipairs(enemyKeywords) do
+        if name:find(kw) then return true end
+    end
+
+    if humanoid.MaxHealth > 150 then return true end
+
+    for _, child in ipairs(model:GetChildren()) do
+        if child:IsA("Tool") then
+            local toolName = child.Name:lower()
+            for _, kw in ipairs({"sword", "gun", "weapon", "blade", "knife",
+                                 "axe", "spear", "bow", "staff", "wand"}) do
+                if toolName:find(kw) then return true end
+            end
+        end
+    end
+
+    return false
+end
+
+local function isUniversalNPC(model)
+    if not isNPC(model) then return false end
+    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+    if not humanoid then return false end
+    return humanoid.Health > 0
+end
+
+local trackedNPCs = {}
+local bodyVelocities = {}
+
+local touchedConnections = {}
+local function setupAntiTouch()
+    if not ANTI_TOUCH then
+        for _, conn in ipairs(touchedConnections) do
+            conn:Disconnect()
+        end
+        touchedConnections = {}
+        return
+    end
+
+    local function protectCharacter(character)
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return end
+
+        local healthCon = humanoid:GetPropertyChangedSignal("Health"):Connect(function()
+            if humanoid.Health < humanoid.MaxHealth and humanoid.Health > 0 then
+                humanoid.Health = humanoid.MaxHealth
+            end
+        end)
+        table.insert(touchedConnections, healthCon)
+
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanTouch then
+                local touchCon = part.Touched:Connect(function(hit)
+                    local npcModel = hit.Parent or hit.Parent.Parent
+                    if npcModel and isNPC(npcModel) then
+                        for _, script in ipairs(npcModel:GetDescendants()) do
+                            if script:IsA("Script") or script:IsA("LocalScript") then
+                                local source = script.Source or ""
+                                if source:lower():find("damage") or
+                                   source:lower():find("hurt") or
+                                   source:lower():find("kill") or
+                                   source:lower():find("health") then
+                                    script.Disabled = true
+                                end
+                            end
+                        end
+
+                        for _, npcPart in ipairs(npcModel:GetDescendants()) do
+                            if npcPart:IsA("BasePart") then
+                                npcPart.Touched:Connect(function() end)
+                            end
+                        end
+                    end
+                end)
+                table.insert(touchedConnections, touchCon)
+            end
+        end
+    end
+
+    protectCharacter(Char)
+    LP.CharacterAdded:Connect(function(newChar)
+        for _, conn in ipairs(touchedConnections) do
+            pcall(function() conn:Disconnect() end)
+        end
+        touchedConnections = {}
+        Char = newChar
+        Root = Char:WaitForChild("HumanoidRootPart", 10)
+        Humanoid = Char:WaitForChild("Humanoid", 10)
+        protectCharacter(newChar)
+    end)
+end
+
+local function getNPCsInRange()
+    local npcs = {}
+    local rootPos = Root and Root.Position
+    if not rootPos then return npcs end
+
+    for _, model in ipairs(workspace:GetDescendants()) do
+        if model:IsA("Model") and isUniversalNPC(model) then
+            local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+            local hrp = model:FindFirstChild("HumanoidRootPart")
+            if humanoid and hrp and humanoid.Health > 0 then
+                local dist = (hrp.Position - rootPos).Magnitude
+                if dist <= RADIUS then
+                    table.insert(npcs, {
+                        model = model,
+                        humanoid = humanoid,
+                        hrp = hrp,
+                        distance = dist
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(npcs, function(a, b) return a.distance < b.distance end)
+
+    if #npcs > MAX_BODIES then
+        local trimmed = {}
+        for i = 1, MAX_BODIES do
+            trimmed[i] = npcs[i]
+        end
+        return trimmed
+    end
+
+    return npcs
+end
+
+local function createBodyVelocity(npcData)
+    local hrp = npcData.hrp
+    local model = npcData.model
+
+    if bodyVelocities[model] then
+        pcall(function() bodyVelocities[model]:Destroy() end)
+    end
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "InfinityAura_BV"
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Velocity = Vector3.zero
+    bv.P = 100000
+    bv.Parent = hrp
+    bodyVelocities[model] = bv
+
+    trackedNPCs[model] = {
+        bodyVelocity = bv,
+        originalWalkSpeed = npcData.humanoid.WalkSpeed,
+        humanoid = npcData.humanoid,
+        hrp = hrp
+    }
+end
+
+local function applyForce(npcData)
+    local rootPos = Root and Root.Position
+    if not rootPos then return end
+
+    local hrp = npcData.hrp
+    local model = npcData.model
+    local humanoid = npcData.humanoid
+    local dist = npcData.distance
+
+    if dist < 0.01 then
+        dist = 0.01
+    end
+
+    if not bodyVelocities[model] then
+        createBodyVelocity(npcData)
+    end
+
+    local bv = bodyVelocities[model]
+    if not bv or not bv.Parent then return end
+
+    local direction = (hrp.Position - rootPos).Unit
+
+    local pushMultiplier = (RADIUS / dist) ^ 3
+    local pushStrength = PUSH_FORCE * pushMultiplier
+    pushStrength = math.clamp(pushStrength, PUSH_FORCE, 10000)
+
+    bv.Velocity = direction * pushStrength
+
+    local originalSpeed = trackedNPCs[model] and trackedNPCs[model].originalWalkSpeed or 16
+    local slowFactor = math.clamp((dist / RADIUS) ^ SLOW_POWER, 0.001, 1)
+    local targetWalkSpeed = originalSpeed * slowFactor
+
+    humanoid.WalkSpeed = humanoid.WalkSpeed + (targetWalkSpeed - humanoid.WalkSpeed) * 0.3
+
+    if humanoid.WalkSpeed < 0.05 then
+        humanoid.WalkSpeed = 0.05
+    end
+
+    if npcData.distance < RADIUS * 0.3 then
+        humanoid.JumpPower = math.clamp(humanoid.JumpPower * 0.8, 0, 1)
+        humanoid.AutoRotate = false
+    end
+
+    trackedNPCs[model].lastPosition = hrp.Position
+end
+
+local function cleanupFarNPCs(activeModels)
+    for model, bv in pairs(bodyVelocities) do
+        if not activeModels[model] and bv and bv.Parent then
+            local data = trackedNPCs[model]
+            if data and data.humanoid then
+                local origSpeed = data.originalWalkSpeed
+                data.humanoid.WalkSpeed = data.humanoid.WalkSpeed +
+                    (origSpeed - data.humanoid.WalkSpeed) * 0.1
+                if math.abs(data.humanoid.WalkSpeed - origSpeed) < 0.5 then
+                    data.humanoid.WalkSpeed = origSpeed
+                    data.humanoid.JumpPower = 50
+                    data.humanoid.AutoRotate = true
+                end
+            end
+
+            pcall(function() bv:Destroy() end)
+            bodyVelocities[model] = nil
+
+            if data then
+                if data.humanoid and data.originalWalkSpeed then
+                    data.humanoid.WalkSpeed = data.originalWalkSpeed
+                    data.humanoid.JumpPower = 50
+                    data.humanoid.AutoRotate = true
+                end
+            end
+            trackedNPCs[model] = nil
+        end
+    end
+end
+
+local visualRing = nil
+local function createVisualRing()
+    if visualRing then
+        pcall(function() visualRing:Destroy() end)
+    end
+
+    if not VISUAL_RING then return end
+
+    visualRing = Instance.new("Part")
+    visualRing.Name = "InfinityAura_Ring"
+    visualRing.Shape = Enum.PartType.Cylinder
+    visualRing.Size = Vector3.new(RADIUS * 2, 0.2, RADIUS * 2)
+    visualRing.Anchored = true
+    visualRing.CanCollide = false
+    visualRing.CanTouch = false
+    visualRing.Transparency = 0.7
+    visualRing.Color = Color3.fromRGB(138, 43, 226)
+    visualRing.Material = Enum.Material.Neon
+    visualRing.Parent = workspace
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "InfinityAura_Label"
+    bb.Size = UDim2.new(0, 200, 0, 30)
+    bb.StudsOffset = Vector3.new(0, 2, 0)
+    bb.AlwaysOnTop = true
+    bb.Parent = visualRing
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = "∞ INFINITY AURA ∞"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextStrokeTransparency = 0.5
+    label.TextStrokeColor3 = Color3.fromRGB(138, 43, 226)
+    label.Font = Enum.Font.SciFi
+    label.TextSize = 18
+    label.Parent = bb
+end
+
+local lastRingUpdate = 0
+local function updateVisualRing()
+    if not VISUAL_RING or not visualRing or not Root then return end
+
+    local now = tick()
+    if now - lastRingUpdate < 0.2 then return end
+    lastRingUpdate = now
+
+    visualRing.Position = Root.Position
+    visualRing.Size = Vector3.new(RADIUS * 2, 0.2, RADIUS * 2)
+end
+
+local function processTick()
+    if not ENABLED then return end
+    if not Root or not Root.Parent then
+        Char = LP.Character
+        if Char then
+            Root = Char:FindFirstChild("HumanoidRootPart")
+            Humanoid = Char:FindFirstChildOfClass("Humanoid")
+        end
+        if not Root then return end
+    end
+
+    updateVisualRing()
+
+    local npcs = getNPCsInRange()
+    local activeModels = {}
+
+    for _, npcData in ipairs(npcs) do
+        activeModels[npcData.model] = true
+        applyForce(npcData)
+    end
+
+    cleanupFarNPCs(activeModels)
+end
+
+local function cleanup()
+    ENABLED = false
+
+    for model, bv in pairs(bodyVelocities) do
+        local data = trackedNPCs[model]
+        if data then
+            if data.humanoid and data.humanoid.Parent then
+                pcall(function()
+                    data.humanoid.WalkSpeed = data.originalWalkSpeed
+                    data.humanoid.JumpPower = 50
+                    data.humanoid.AutoRotate = true
+                end)
+            end
+        end
+        if bv and bv.Parent then
+            pcall(function() bv:Destroy() end)
+        end
+    end
+
+    bodyVelocities = {}
+    trackedNPCs = {}
+
+    if visualRing then
+        pcall(function() visualRing:Destroy() end)
+        visualRing = nil
+    end
+
+    for _, conn in ipairs(touchedConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    touchedConnections = {}
+end
+
+local function toggle()
+    ENABLED = not ENABLED
+    if ENABLED then
+        createVisualRing()
+        if SHOW_NOTIFICATIONS then
+            print("[∞ Infinity Aura] ENABLED — Pushing NPCs away with infinite force!")
+        end
+    else
+        cleanup()
+        if SHOW_NOTIFICATIONS then
+            print("[∞ Infinity Aura] DISABLED — All NPCs restored to normal.")
+        end
+    end
+end
+
+local function setRadius(newRadius)
+    RADIUS = math.clamp(newRadius, 10, 200)
+    createVisualRing()
+    if SHOW_NOTIFICATIONS then
+        print("[∞ Infinity Aura] Radius set to:", RADIUS)
+    end
+end
+
+local function setForce(newForce)
+    PUSH_FORCE = math.clamp(newForce, 10, 500)
+    if SHOW_NOTIFICATIONS then
+        print("[∞ Infinity Aura] Push force set to:", PUSH_FORCE)
+    end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        toggle()
+    end
+    if input.KeyCode == Enum.KeyCode.End then
+        cleanup()
+        if SHOW_NOTIFICATIONS then
+            print("[∞ Infinity Aura] CLEANED UP — Script ready for removal.")
+        end
+    end
+end)
+
+createVisualRing()
+setupAntiTouch()
+
+RunService.Heartbeat:Connect(processTick)
+
+LP.CharacterAdded:Connect(function(newChar)
+    for model, bv in pairs(bodyVelocities) do
+        if bv and bv.Parent then
+            pcall(function() bv:Destroy() end)
+        end
+    end
+    bodyVelocities = {}
+    trackedNPCs = {}
+
+    Char = newChar
+    Root = Char:WaitForChild("HumanoidRootPart", 10)
+    Humanoid = Char:WaitForChild("Humanoid", 10)
+    setupAntiTouch()
+    if ENABLED then
+        createVisualRing()
+    end
+end)
+
+if SHOW_NOTIFICATIONS then
+    print([[
+    ╔══════════════════════════════════════╗
+    ║       ∞ INFINITY AURA LOADED ∞      ║
+    ║   ──────────────────────────────     ║
+    ║   [RightShift] → Toggle On/Off      ║
+    ║   [End]       → Full Cleanup        ║
+    ║   ──────────────────────────────     ║
+    ║   Radius: ]] .. RADIUS .. [[ studs                   ║
+    ║   Force:  ]] .. PUSH_FORCE .. [[                      ║
+    ║   Anti-Touch: ]] .. (ANTI_TOUCH and "ON" or "OFF") .. [[                 ║
+    ║   Visual Ring: ]] .. (VISUAL_RING and "ON" or "OFF") .. [[               ║
+    ╚══════════════════════════════════════╝
+    ]])
+    print("[∞] NPCs will be pushed away and infinitely slowed!")
+    print("[∞] You can touch them — they CANNOT touch you!")
+end
+
+getgenv().InfinityAura = {
+    Toggle = toggle,
+    Enable = function() ENABLED = true createVisualRing() end,
+    Disable = function() cleanup() end,
+    SetRadius = setRadius,
+    SetForce = setForce,
+    IsEnabled = function() return ENABLED end,
+    Cleanup = cleanup,
+}
+
+return getgenv().InfinityAura
