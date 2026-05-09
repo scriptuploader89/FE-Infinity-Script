@@ -1,7 +1,6 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local Debris = game:GetService("Debris")
 
 local LP = Players.LocalPlayer
 local Char = LP.Character or LP.CharacterAdded:Wait()
@@ -11,191 +10,145 @@ local Humanoid = Char:WaitForChild("Humanoid", 10)
 local RADIUS = 50
 local PUSH_FORCE = 75
 local SLOW_POWER = 3
-local MAX_BODIES = 300
-local SLEEP_INTERVAL = 0.05
+local MAX_NPCS = 200
 
 local ENABLED = true
 local ANTI_TOUCH = true
 local VISUAL_RING = true
-local SHOW_NOTIFICATIONS = true
+
+local trackedNPCs = {}
+local bodyVelocities = {}
+local touchedConns = {}
+local rescanTimer = 0
+local RESCAN_INTERVAL = 0.5
+
+local visualRing = nil
+local ringLastUpdate = 0
 
 local function isNPC(model)
     if not model or model == Char then return false end
     if model.Parent == Char then return false end
-
-    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
-    if not humanoid then return false end
-    if humanoid == Humanoid then return false end
-    if humanoid.Health <= 0 then return false end
-
-    local playerFromChar = Players:GetPlayerFromCharacter(model)
-    if playerFromChar then return false end
-
+    local hum = model:FindFirstChildWhichIsA("Humanoid")
+    if not hum or hum == Humanoid or hum.Health <= 0 then return false end
+    if Players:GetPlayerFromCharacter(model) then return false end
     return true
 end
 
-local function isEnemyNPC(model)
-    if not isNPC(model) then return false end
-    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
-    if not humanoid then return false end
-
-    local name = model.Name:lower()
-    local enemyKeywords = {"enemy", "npc", "monster", "boss", "zombie", "mob",
-                           "bandit", "guard", "soldier", "slime", "ghost", "skeleton",
-                           "goblin", "orc", "troll", "dragon", "spider", "bat",
-                           "wolf", "cultist", "pirate", "ninja", "samurai",
-                           "demon", "devil", "angel", "robot", "drone", "turret",
-                           "noob", "dummy", "target", "raid", "bounty"}
-
-    for _, kw in ipairs(enemyKeywords) do
-        if name:find(kw) then return true end
+local function protectChar(char)
+    for _, conn in ipairs(touchedConns) do
+        pcall(function() conn:Disconnect() end)
     end
+    touchedConns = {}
 
-    if humanoid.MaxHealth > 150 then return true end
-
-    for _, child in ipairs(model:GetChildren()) do
-        if child:IsA("Tool") then
-            local toolName = child.Name:lower()
-            for _, kw in ipairs({"sword", "gun", "weapon", "blade", "knife",
-                                 "axe", "spear", "bow", "staff", "wand"}) do
-                if toolName:find(kw) then return true end
-            end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanTouch = false
         end
     end
 
-    return false
-end
-
-local function isUniversalNPC(model)
-    if not isNPC(model) then return false end
-    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
-    if not humanoid then return false end
-    return humanoid.Health > 0
-end
-
-local trackedNPCs = {}
-local bodyVelocities = {}
-
-local touchedConnections = {}
-local function setupAntiTouch()
-    if not ANTI_TOUCH then
-        for _, conn in ipairs(touchedConnections) do
-            conn:Disconnect()
-        end
-        touchedConnections = {}
-        return
-    end
-
-    local function protectCharacter(character)
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        if not humanoid then return end
-
-        local healthCon = humanoid:GetPropertyChangedSignal("Health"):Connect(function()
-            if humanoid.Health < humanoid.MaxHealth and humanoid.Health > 0 then
-                humanoid.Health = humanoid.MaxHealth
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local c = hum:GetPropertyChangedSignal("Health"):Connect(function()
+            if hum.Health > 0 and hum.Health < hum.MaxHealth then
+                hum.Health = hum.MaxHealth
             end
         end)
-        table.insert(touchedConnections, healthCon)
-
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") and part.CanTouch then
-                local touchCon = part.Touched:Connect(function(hit)
-                    local npcModel = hit.Parent or hit.Parent.Parent
-                    if npcModel and isNPC(npcModel) then
-                        for _, script in ipairs(npcModel:GetDescendants()) do
-                            if script:IsA("Script") or script:IsA("LocalScript") then
-                                local source = script.Source or ""
-                                if source:lower():find("damage") or
-                                   source:lower():find("hurt") or
-                                   source:lower():find("kill") or
-                                   source:lower():find("health") then
-                                    script.Disabled = true
-                                end
-                            end
-                        end
-
-                        for _, npcPart in ipairs(npcModel:GetDescendants()) do
-                            if npcPart:IsA("BasePart") then
-                                npcPart.Touched:Connect(function() end)
-                            end
-                        end
-                    end
-                end)
-                table.insert(touchedConnections, touchCon)
-            end
-        end
+        table.insert(touchedConns, c)
     end
-
-    protectCharacter(Char)
-    LP.CharacterAdded:Connect(function(newChar)
-        for _, conn in ipairs(touchedConnections) do
-            pcall(function() conn:Disconnect() end)
-        end
-        touchedConnections = {}
-        Char = newChar
-        Root = Char:WaitForChild("HumanoidRootPart", 10)
-        Humanoid = Char:WaitForChild("Humanoid", 10)
-        protectCharacter(newChar)
-    end)
 end
 
-local function getNPCsInRange()
+protectChar(Char)
+
+LP.CharacterAdded:Connect(function(newChar)
+    for _, conn in ipairs(touchedConns) do
+        pcall(function() conn:Disconnect() end)
+    end
+    touchedConns = {}
+    for model, bv in pairs(bodyVelocities) do
+        if bv and bv.Parent then
+            pcall(function() bv:Destroy() end)
+        end
+    end
+    bodyVelocities = {}
+    trackedNPCs = {}
+
+    Char = newChar
+    Root = Char:WaitForChild("HumanoidRootPart", 10)
+    Humanoid = Char:WaitForChild("Humanoid", 10)
+    protectChar(Char)
+    if ENABLED and VISUAL_RING then
+        createVisualRing()
+    end
+end)
+
+local function scanNPCs()
     local npcs = {}
     local rootPos = Root and Root.Position
     if not rootPos then return npcs end
 
-    for _, model in ipairs(workspace:GetDescendants()) do
-        if model:IsA("Model") and isUniversalNPC(model) then
-            local humanoid = model:FindFirstChildWhichIsA("Humanoid")
-            local hrp = model:FindFirstChild("HumanoidRootPart")
-            if humanoid and hrp and humanoid.Health > 0 then
-                local dist = (hrp.Position - rootPos).Magnitude
-                if dist <= RADIUS then
-                    table.insert(npcs, {
-                        model = model,
-                        humanoid = humanoid,
-                        hrp = hrp,
-                        distance = dist
-                    })
+    local success, parts = pcall(function()
+        local overlapParams = OverlapParams.new()
+        overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+        overlapParams.FilterDescendantsInstances = {Char}
+        return workspace:GetPartBoundsInRadius(rootPos, RADIUS, overlapParams)
+    end)
+
+    if success and parts then
+        local seen = {}
+        for _, part in ipairs(parts) do
+            local model = part.Parent
+            if model and model:IsA("Model") and not seen[model] then
+                seen[model] = true
+                if isNPC(model) then
+                    local hum = model:FindFirstChildWhichIsA("Humanoid")
+                    local hrp = model:FindFirstChild("HumanoidRootPart")
+                    if hum and hrp and hum.Health > 0 then
+                        local dist = (hrp.Position - rootPos).Magnitude
+                        table.insert(npcs, {model = model, humanoid = hum, hrp = hrp, distance = dist})
+                    end
+                end
+            end
+        end
+    else
+        for _, model in ipairs(workspace:GetDescendants()) do
+            if #npcs >= MAX_NPCS then break end
+            if model:IsA("Model") and isNPC(model) then
+                local hum = model:FindFirstChildWhichIsA("Humanoid")
+                local hrp = model:FindFirstChild("HumanoidRootPart")
+                if hum and hrp and hum.Health > 0 then
+                    local dist = (hrp.Position - rootPos).Magnitude
+                    if dist <= RADIUS then
+                        table.insert(npcs, {model = model, humanoid = hum, hrp = hrp, distance = dist})
+                    end
                 end
             end
         end
     end
 
     table.sort(npcs, function(a, b) return a.distance < b.distance end)
-
-    if #npcs > MAX_BODIES then
-        local trimmed = {}
-        for i = 1, MAX_BODIES do
-            trimmed[i] = npcs[i]
-        end
-        return trimmed
+    if #npcs > MAX_NPCS then
+        local t = {}
+        for i = 1, MAX_NPCS do t[i] = npcs[i] end
+        return t
     end
-
     return npcs
 end
 
-local function createBodyVelocity(npcData)
-    local hrp = npcData.hrp
+local function createBV(npcData)
     local model = npcData.model
-
     if bodyVelocities[model] then
         pcall(function() bodyVelocities[model]:Destroy() end)
     end
-
     local bv = Instance.new("BodyVelocity")
-    bv.Name = "InfinityAura_BV"
     bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
     bv.Velocity = Vector3.zero
     bv.P = 100000
-    bv.Parent = hrp
+    bv.Parent = npcData.hrp
     bodyVelocities[model] = bv
-
     trackedNPCs[model] = {
-        bodyVelocity = bv,
-        originalWalkSpeed = npcData.humanoid.WalkSpeed,
         humanoid = npcData.humanoid,
-        hrp = hrp
+        hrp = npcData.hrp,
+        originalWalkSpeed = npcData.humanoid.WalkSpeed
     }
 end
 
@@ -203,130 +156,137 @@ local function applyForce(npcData)
     local rootPos = Root and Root.Position
     if not rootPos then return end
 
-    local hrp = npcData.hrp
     local model = npcData.model
-    local humanoid = npcData.humanoid
+    local hum = npcData.humanoid
+    local hrp = npcData.hrp
     local dist = npcData.distance
-
-    if dist < 0.01 then
-        dist = 0.01
-    end
+    if dist < 0.01 then dist = 0.01 end
 
     if not bodyVelocities[model] then
-        createBodyVelocity(npcData)
+        createBV(npcData)
     end
-
     local bv = bodyVelocities[model]
     if not bv or not bv.Parent then return end
 
-    local direction = (hrp.Position - rootPos).Unit
+    local dir = (hrp.Position - rootPos).Unit
+    local mult = (RADIUS / dist) ^ 3
+    local strength = math.clamp(PUSH_FORCE * mult, PUSH_FORCE, 10000)
+    bv.Velocity = dir * strength
 
-    local pushMultiplier = (RADIUS / dist) ^ 3
-    local pushStrength = PUSH_FORCE * pushMultiplier
-    pushStrength = math.clamp(pushStrength, PUSH_FORCE, 10000)
+    local origSpeed = trackedNPCs[model] and trackedNPCs[model].originalWalkSpeed or 16
+    local factor = math.clamp((dist / RADIUS) ^ SLOW_POWER, 0.001, 1)
+    local targetSpeed = origSpeed * factor
+    hum.WalkSpeed = hum.WalkSpeed + (targetSpeed - hum.WalkSpeed) * 0.3
+    if hum.WalkSpeed < 0.05 then hum.WalkSpeed = 0.05 end
 
-    bv.Velocity = direction * pushStrength
-
-    local originalSpeed = trackedNPCs[model] and trackedNPCs[model].originalWalkSpeed or 16
-    local slowFactor = math.clamp((dist / RADIUS) ^ SLOW_POWER, 0.001, 1)
-    local targetWalkSpeed = originalSpeed * slowFactor
-
-    humanoid.WalkSpeed = humanoid.WalkSpeed + (targetWalkSpeed - humanoid.WalkSpeed) * 0.3
-
-    if humanoid.WalkSpeed < 0.05 then
-        humanoid.WalkSpeed = 0.05
+    if dist < RADIUS * 0.3 then
+        hum.JumpPower = math.clamp(hum.JumpPower * 0.8, 0, 1)
+        hum.AutoRotate = false
     end
-
-    if npcData.distance < RADIUS * 0.3 then
-        humanoid.JumpPower = math.clamp(humanoid.JumpPower * 0.8, 0, 1)
-        humanoid.AutoRotate = false
-    end
-
-    trackedNPCs[model].lastPosition = hrp.Position
 end
 
-local function cleanupFarNPCs(activeModels)
+local function cleanupFar(active)
     for model, bv in pairs(bodyVelocities) do
-        if not activeModels[model] and bv and bv.Parent then
+        if not active[model] and bv and bv.Parent then
             local data = trackedNPCs[model]
-            if data and data.humanoid then
-                local origSpeed = data.originalWalkSpeed
-                data.humanoid.WalkSpeed = data.humanoid.WalkSpeed +
-                    (origSpeed - data.humanoid.WalkSpeed) * 0.1
-                if math.abs(data.humanoid.WalkSpeed - origSpeed) < 0.5 then
-                    data.humanoid.WalkSpeed = origSpeed
+            if data and data.humanoid and data.humanoid.Parent then
+                local orig = data.originalWalkSpeed
+                data.humanoid.WalkSpeed = data.humanoid.WalkSpeed + (orig - data.humanoid.WalkSpeed) * 0.1
+                if math.abs(data.humanoid.WalkSpeed - orig) < 0.5 then
+                    data.humanoid.WalkSpeed = orig
                     data.humanoid.JumpPower = 50
                     data.humanoid.AutoRotate = true
                 end
             end
-
             pcall(function() bv:Destroy() end)
             bodyVelocities[model] = nil
-
-            if data then
-                if data.humanoid and data.originalWalkSpeed then
-                    data.humanoid.WalkSpeed = data.originalWalkSpeed
-                    data.humanoid.JumpPower = 50
-                    data.humanoid.AutoRotate = true
-                end
-            end
             trackedNPCs[model] = nil
         end
     end
 end
 
-local visualRing = nil
 local function createVisualRing()
     if visualRing then
         pcall(function() visualRing:Destroy() end)
     end
-
     if not VISUAL_RING then return end
-
     visualRing = Instance.new("Part")
-    visualRing.Name = "InfinityAura_Ring"
+    visualRing.Name = "InfinityRing"
     visualRing.Shape = Enum.PartType.Cylinder
     visualRing.Size = Vector3.new(RADIUS * 2, 0.2, RADIUS * 2)
     visualRing.Anchored = true
     visualRing.CanCollide = false
     visualRing.CanTouch = false
+    visualRing.CanQuery = false
     visualRing.Transparency = 0.7
     visualRing.Color = Color3.fromRGB(138, 43, 226)
     visualRing.Material = Enum.Material.Neon
     visualRing.Parent = workspace
-
-    local bb = Instance.new("BillboardGui")
-    bb.Name = "InfinityAura_Label"
-    bb.Size = UDim2.new(0, 200, 0, 30)
-    bb.StudsOffset = Vector3.new(0, 2, 0)
-    bb.AlwaysOnTop = true
-    bb.Parent = visualRing
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, 0, 1, 0)
-    label.BackgroundTransparency = 1
-    label.Text = "∞ INFINITY AURA ∞"
-    label.TextColor3 = Color3.fromRGB(255, 255, 255)
-    label.TextStrokeTransparency = 0.5
-    label.TextStrokeColor3 = Color3.fromRGB(138, 43, 226)
-    label.Font = Enum.Font.SciFi
-    label.TextSize = 18
-    label.Parent = bb
 end
 
-local lastRingUpdate = 0
 local function updateVisualRing()
     if not VISUAL_RING or not visualRing or not Root then return end
-
     local now = tick()
-    if now - lastRingUpdate < 0.2 then return end
-    lastRingUpdate = now
-
+    if now - ringLastUpdate < 0.3 then return end
+    ringLastUpdate = now
     visualRing.Position = Root.Position
-    visualRing.Size = Vector3.new(RADIUS * 2, 0.2, RADIUS * 2)
 end
 
-local function processTick()
+local function cleanup()
+    ENABLED = false
+    for model, bv in pairs(bodyVelocities) do
+        local data = trackedNPCs[model]
+        if data and data.humanoid and data.humanoid.Parent then
+            pcall(function()
+                data.humanoid.WalkSpeed = data.originalWalkSpeed
+                data.humanoid.JumpPower = 50
+                data.humanoid.AutoRotate = true
+            end)
+        end
+        if bv and bv.Parent then
+            pcall(function() bv:Destroy() end)
+        end
+    end
+    bodyVelocities = {}
+    trackedNPCs = {}
+    if visualRing then
+        pcall(function() visualRing:Destroy() end)
+        visualRing = nil
+    end
+end
+
+local function toggle()
+    ENABLED = not ENABLED
+    if ENABLED then
+        if VISUAL_RING then createVisualRing() end
+        print("[∞] ON")
+    else
+        cleanup()
+        print("[∞] OFF")
+    end
+end
+
+local function setRadius(r)
+    RADIUS = math.clamp(r, 10, 200)
+    if VISUAL_RING then createVisualRing() end
+    print("[∞] Radius:", RADIUS)
+end
+
+local function setForce(f)
+    PUSH_FORCE = math.clamp(f, 10, 500)
+    print("[∞] Force:", PUSH_FORCE)
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then toggle() end
+    if input.KeyCode == Enum.KeyCode.End then cleanup() print("[∞] CLEANED") end
+end)
+
+local cachedNPCs = {}
+local lastScan = 0
+
+local function tick()
     if not ENABLED then return end
     if not Root or not Root.Parent then
         Char = LP.Character
@@ -339,142 +299,48 @@ local function processTick()
 
     updateVisualRing()
 
-    local npcs = getNPCsInRange()
-    local activeModels = {}
-
-    for _, npcData in ipairs(npcs) do
-        activeModels[npcData.model] = true
-        applyForce(npcData)
-    end
-
-    cleanupFarNPCs(activeModels)
-end
-
-local function cleanup()
-    ENABLED = false
-
-    for model, bv in pairs(bodyVelocities) do
-        local data = trackedNPCs[model]
-        if data then
-            if data.humanoid and data.humanoid.Parent then
-                pcall(function()
-                    data.humanoid.WalkSpeed = data.originalWalkSpeed
-                    data.humanoid.JumpPower = 50
-                    data.humanoid.AutoRotate = true
-                end)
+    local now = tick()
+    if now - lastScan >= RESCAN_INTERVAL then
+        cachedNPCs = scanNPCs()
+        lastScan = now
+    else
+        local rootPos = Root.Position
+        for _, npc in ipairs(cachedNPCs) do
+            if npc.hrp and npc.hrp.Parent then
+                npc.distance = (npc.hrp.Position - rootPos).Magnitude
             end
         end
-        if bv and bv.Parent then
-            pcall(function() bv:Destroy() end)
+    end
+
+    local active = {}
+    for _, npc in ipairs(cachedNPCs) do
+        if npc.distance <= RADIUS and npc.hrp and npc.hrp.Parent and npc.humanoid and npc.humanoid.Health > 0 then
+            active[npc.model] = true
+            applyForce(npc)
         end
     end
-
-    bodyVelocities = {}
-    trackedNPCs = {}
-
-    if visualRing then
-        pcall(function() visualRing:Destroy() end)
-        visualRing = nil
-    end
-
-    for _, conn in ipairs(touchedConnections) do
-        pcall(function() conn:Disconnect() end)
-    end
-    touchedConnections = {}
+    cleanupFar(active)
 end
 
-local function toggle()
-    ENABLED = not ENABLED
-    if ENABLED then
-        createVisualRing()
-        if SHOW_NOTIFICATIONS then
-            print("[∞ Infinity Aura] ENABLED — Pushing NPCs away with infinite force!")
-        end
-    else
-        cleanup()
-        if SHOW_NOTIFICATIONS then
-            print("[∞ Infinity Aura] DISABLED — All NPCs restored to normal.")
-        end
-    end
-end
+if VISUAL_RING then createVisualRing() end
 
-local function setRadius(newRadius)
-    RADIUS = math.clamp(newRadius, 10, 200)
-    createVisualRing()
-    if SHOW_NOTIFICATIONS then
-        print("[∞ Infinity Aura] Radius set to:", RADIUS)
-    end
-end
-
-local function setForce(newForce)
-    PUSH_FORCE = math.clamp(newForce, 10, 500)
-    if SHOW_NOTIFICATIONS then
-        print("[∞ Infinity Aura] Push force set to:", PUSH_FORCE)
-    end
-end
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if input.KeyCode == Enum.KeyCode.RightShift then
-        toggle()
-    end
-    if input.KeyCode == Enum.KeyCode.End then
-        cleanup()
-        if SHOW_NOTIFICATIONS then
-            print("[∞ Infinity Aura] CLEANED UP — Script ready for removal.")
-        end
+local running = true
+task.spawn(function()
+    while running do
+        pcall(tick)
+        task.wait(0.08)
     end
 end)
-
-createVisualRing()
-setupAntiTouch()
-
-RunService.Heartbeat:Connect(processTick)
-
-LP.CharacterAdded:Connect(function(newChar)
-    for model, bv in pairs(bodyVelocities) do
-        if bv and bv.Parent then
-            pcall(function() bv:Destroy() end)
-        end
-    end
-    bodyVelocities = {}
-    trackedNPCs = {}
-
-    Char = newChar
-    Root = Char:WaitForChild("HumanoidRootPart", 10)
-    Humanoid = Char:WaitForChild("Humanoid", 10)
-    setupAntiTouch()
-    if ENABLED then
-        createVisualRing()
-    end
-end)
-
-if SHOW_NOTIFICATIONS then
-    print([[
-    ╔══════════════════════════════════════╗
-    ║       ∞ INFINITY AURA LOADED ∞      ║
-    ║   ──────────────────────────────     ║
-    ║   [RightShift] → Toggle On/Off      ║
-    ║   [End]       → Full Cleanup        ║
-    ║   ──────────────────────────────     ║
-    ║   Radius: ]] .. RADIUS .. [[ studs                   ║
-    ║   Force:  ]] .. PUSH_FORCE .. [[                      ║
-    ║   Anti-Touch: ]] .. (ANTI_TOUCH and "ON" or "OFF") .. [[                 ║
-    ║   Visual Ring: ]] .. (VISUAL_RING and "ON" or "OFF") .. [[               ║
-    ╚══════════════════════════════════════╝
-    ]])
-    print("[∞] NPCs will be pushed away and infinitely slowed!")
-    print("[∞] You can touch them — they CANNOT touch you!")
-end
 
 getgenv().InfinityAura = {
     Toggle = toggle,
-    Enable = function() ENABLED = true createVisualRing() end,
-    Disable = function() cleanup() end,
+    Enable = function() ENABLED = true if VISUAL_RING then createVisualRing() end end,
+    Disable = cleanup,
     SetRadius = setRadius,
     SetForce = setForce,
     IsEnabled = function() return ENABLED end,
     Cleanup = cleanup,
 }
 
+print("[∞] INFINITY AURA LOADED | RightShift=Toggle | End=Cleanup")
 return getgenv().InfinityAura
